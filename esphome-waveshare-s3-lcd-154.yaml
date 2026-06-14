@@ -1,0 +1,572 @@
+# =============================================================================
+#  Waveshare ESP32-S3-Touch-LCD-1.54  (SKU 33869 - touch + battery)
+#  Optimal ESPHome configuration created with the help of Claude Code
+# =============================================================================
+#  Hardware:
+#    - ESP32-S3R8  (16 MB Flash, 8 MB PSRAM octal)
+#    - LCD ST7789V2  240x240  SPI 4-wire  (IPS, inverted colors)
+#    - Touch CST816T  I2C 0x15  (shared bus)
+#    - IMU QMI8658  6-axis  (same I2C bus)
+#    - Audio ES8311 (speaker) + ES7210 (mic 0x40)
+#    - Battery management + MX1.25 connector
+#    - microSD slot (SDMMC 4-bit)
+#
+#  >>> VERIFIED PINS <<<
+#  The active pins below come from the OFFICIAL Waveshare DEMO CODE:
+#  https://github.com/waveshareteam/ESP32-S3-Touch-LCD-1.54  (Arduino examples 04/09/etc.)
+#  Display: DC=45 CS=21 SCK=38 MOSI=39 RST=40 BL=46 (Arduino_ESP32SPI/ST7789, IPS=true)
+#  Touch CST816: I2C bus SDA=42 SCL=41, INT=48, RST=47
+#  I2C bus 42/41 is SHARED by touch + IMU QMI8658 + audio codecs ES8311/ES7210.
+#  Battery ADC pin GPIO1.
+# =============================================================================
+
+esphome:
+  name: "esphome-waveshare"
+  friendly_name: "ESPHome Waveshare S3 LCD 1.54"
+  # Turn on the backlight at startup
+  on_boot:
+    priority: 600
+    then:
+      # Power LATCH (BAT_EN=GPIO2): held HIGH as early as possible, so the device
+      # stays on from battery after releasing the PWR button and doesn't turn off when unplugging USB.
+      - output.turn_on: bat_power_hold
+      - light.turn_on:
+          id: backlight
+          brightness: 80%
+      - script.execute: screen_timeout    # start the display turn-off countdown
+      # Audio warm-up: start the I2S at boot while the PA is off, so the
+      # clock start-up transient is silent. From here the I2S stays always active
+      # (timeout: never): subsequent playbacks don't restart it -> no pop.
+      - delay: 2s                         # wait for the audio subsystem to be ready
+      - speaker.play:
+          id: i2s_speaker
+          data: !lambda 'return std::vector<uint8_t>(48000, 0);'   # ~0.5s of silence (48kHz/16bit)
+      # The PA stays OFF now; the media_player turns it on only during audio (on_play/on_idle).
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+# Octal 8 MB PSRAM (ESP32-S3R8): needed by LVGL for the framebuffer
+psram:
+  mode: octal
+  speed: 80MHz
+
+# Enable logging
+logger:
+  level: INFO
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    # Update the clock once a minute (on the minute tick) and immediately
+    # as soon as the time syncs.
+    on_time_sync:
+      then:
+        - lvgl.label.update:
+            id: lbl_clock
+            text: !lambda 'return id(ha_time).now().strftime("%H:%M");'
+    on_time:
+      - seconds: 0
+        then:
+          - lvgl.label.update:
+              id: lbl_clock
+              text: !lambda 'return id(ha_time).now().strftime("%H:%M");'
+
+# -----------------------------------------------------------------------------
+#  SPI bus (display) and I2C (touch + IMU + audio codec, shared)
+# -----------------------------------------------------------------------------
+spi:
+  clk_pin: GPIO38         # display SCK
+  mosi_pin: GPIO39        # display MOSI
+
+i2c:
+  - id: bus_a
+    sda: GPIO42           # shared bus: touch CST816, IMU QMI8658, ES8311, ES7210
+    scl: GPIO41
+    frequency: 400kHz
+
+output:
+  - platform: ledc
+    pin: GPIO46           # backlight BL (GFX_BL) (dimmable PWM, exposed as a light in HA)
+    id: backlight_output
+    frequency: 1000Hz
+  - platform: gpio
+    pin: GPIO7            # amplifier PA enable (on only during playback)
+    id: pa_enable
+  - platform: gpio
+    pin: GPIO2            # BAT_EN: power latch (keep HIGH to stay powered on battery)
+    id: bat_power_hold
+
+light:
+  - platform: monochromatic
+    name: "Display Backlight"
+    id: backlight
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+    # The initial brightness (80%) is set in esphome -> on_boot -> light.turn_on
+    # LVGL state follows the backlight: turning the screen on/off from HA
+    # behaves like wake/standby from touch (LVGL resume / pause).
+    on_turn_on:
+      - lvgl.resume:
+      - lvgl.widget.redraw:
+      - script.execute: screen_timeout    # (re)start the turn-off countdown
+    on_turn_off:
+      - lvgl.pause:
+
+# -----------------------------------------------------------------------------
+#  Display ST7789V2  240x240  (IPS -> invert_colors: true)
+# -----------------------------------------------------------------------------
+display:
+  - platform: mipi_spi          # recommended driver (replaces st7789v)
+    model: ST7789V
+    id: main_display
+    cs_pin: GPIO21
+    dc_pin: GPIO45
+    reset_pin: GPIO40
+    dimensions:
+      width: 240
+      height: 240
+      offset_width: 0
+      offset_height: 80         # ST7789: GRAM 240x320, panel 240x240 -> 80px unused.
+                                # With rotation:180 the visible window shifts to rows 80-319,
+                                # IMPORTANT: set to 80 if lvgl rotation 180 (with rotation 0 set to 0).
+    invert_colors: true
+    update_interval: never      # LVGL handles the refresh
+    auto_clear_enabled: false
+
+# -----------------------------------------------------------------------------
+#  Touch CST816  (INT=48, RST=47, address 0x15)
+# -----------------------------------------------------------------------------
+touchscreen:
+  - platform: cst816
+    id: main_touch
+    i2c_id: bus_a
+    interrupt_pin: GPIO48
+    reset_pin: GPIO47
+    # Every touch wakes the display (if off) and restarts the turn-off timeout
+    on_touch:
+      - script.execute: wake_display
+    # skip_probe: true            # enable if the chip doesn't respond until touched
+    # The I2C address 0x15 is the component default
+
+# -----------------------------------------------------------------------------
+#  LVGL INTERFACE
+#  Minimal example dashboard: clock, date, WiFi signal and a button that
+#  controls a Home Assistant entity. Customize it freely.
+# -----------------------------------------------------------------------------
+# NB: the turn-off after 60s is handled by the 'screen_timeout' script (see below),
+# so physical buttons can reset it too (LVGL's on_idle reacts only to touch).
+# (Clock handled by the 'time' component -> on_time, once a minute)
+# Below follows the LVGL widget configuration, customize at will
+
+font:                         #  Custom clock font
+  - file: "gfonts://Montserrat"
+    id: clock_font
+    size: 72                  # +50% compared to montserrat_48
+    bpp: 4                    # anti-aliasing: smooth edges at large sizes
+    glyphs: "0123456789:-"    # only the characters used by the clock (HH:MM and "--:--")
+  # Material Design Icons font (same icons as Home Assistant)
+  - file: "https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf"
+    id: mdi_icons
+    size: 40
+    bpp: 4
+    glyphs:
+      - "\U000F06E8"   # mdi:lightbulb-on  (Light icon, left)
+      - "\U000F07E5"   # mdi:pipe          (Recirculation icon, right)
+
+lvgl:
+  displays:
+    - main_display
+  touchscreens:
+    - main_touch
+  rotation: 180               # rotate the WHOLE screen by 180 (device mounted upside down); also rotates the touch
+                              # IMPORTANT: if set to 180 you must also set offset_height to 80
+                              # if set to 0, offset_height must be set to 0 (see above)
+  buffer_size: 25%
+  color_depth: 16
+  bg_color: 0x000000
+  pages:                      # customizable LVGL code
+    - id: main_page
+      bg_color: 0x000000
+      pad_all: 0
+      widgets:
+        - obj:
+            id: background
+            x: 0
+            y: 0
+            width: 240
+            height: 240
+            align: CENTER
+            bg_color: 0x000000
+            border_width: 0
+            radius: 0
+            pad_all: 0
+            widgets:
+              - label:
+                  id: lbl_title
+                  x: 0
+                  y: 0
+                  width: 240
+                  align: TOP_MID
+                  text: "My Room Controls"
+                  text_color: 0xFFFFFF
+                  text_align: CENTER
+                  long_mode: wrap
+                  text_font: montserrat_24
+              - label:
+                  id: lbl_clock
+                  x: 0
+                  y: -10
+                  align: CENTER
+                  text: "--:--"
+                  text_color: 0xFFFFFF
+                  text_align: CENTER
+                  text_font: clock_font
+              - label:                       # Icons (initially hidden, can be shown via the HA switches)
+                  id: icon_luce
+                  align: RIGHT_MID
+                  x: -6
+                  y: -50
+                  text: "\U000F06E8"         # mdi:lightbulb-on
+                  text_font: mdi_icons
+                  text_color: 0xFFD000       # yellow
+                  hidden: true
+              - label:
+                  id: icon_ricircolo
+                  align: LEFT_MID
+                  x: 6
+                  y: -50
+                  text: "\U000F07E5"         # mdi:pipe
+                  text_font: mdi_icons
+                  text_color: 0x4FC3F7       # light blue
+                  hidden: true
+              - label:
+                  id: lbl_wifi
+                  x: 0
+                  y: 0
+                  align: BOTTOM_MID
+                  text: "WiFi: -- dBm"
+                  text_color: 0x808080
+                  text_align: CENTER
+                  text_font: montserrat_20
+              - button:                      # example button usable to trigger something in HA
+                  id: btn_toggle
+                  x: 0
+                  y: -40
+                  width: 170
+                  height: 46
+                  align: BOTTOM_MID
+                  bg_color: 0x2D7D46
+                  text_color: 0xFFFFFF
+                  widgets:
+                    - label:
+                        id: btn_label
+                        x: 0
+                        y: 00
+                        align: CENTER
+                        text: "Toggle example"
+                        text_color: 0xFFFFFF
+                  on_click:
+                    - homeassistant.service:
+                        service: light.toggle
+                        data:
+                          entity_id: light.example
+
+# -----------------------------------------------------------------------------
+#  Switches to show/hide the icons on the display (exposed to Home Assistant)
+# -----------------------------------------------------------------------------
+switch:
+  - platform: template
+    name: "Show Light Icon"
+    id: sw_icon_luce
+    icon: "mdi:lightbulb-on"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lvgl.widget.show: icon_luce
+    turn_off_action:
+      - lvgl.widget.hide: icon_luce
+
+  - platform: template
+    name: "Show Recirculation Icon"
+    id: sw_icon_ricircolo
+    icon: "mdi:pipe"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lvgl.widget.show: icon_ricircolo
+    turn_off_action:
+      - lvgl.widget.hide: icon_ricircolo
+
+# -----------------------------------------------------------------------------
+#  Display turn-off (60s timeout) + wake from touch or physical buttons
+# -----------------------------------------------------------------------------
+script:
+  # Counts 60s; when it expires it turns off the backlight and pauses LVGL.
+  # mode: restart -> every interaction (touch or button) restarts it from scratch.
+  - id: screen_timeout
+    mode: restart
+    then:
+      - delay: 60s
+      - light.turn_off: backlight    # -> backlight on_turn_off -> LVGL paused
+
+  # Wakes the display if off and (re)starts the countdown. Used by touch and buttons.
+  - id: wake_display
+    then:
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - light.turn_on: backlight       # -> backlight on_turn_on: resume + redraw + (re)start timer
+          else:
+            - script.execute: screen_timeout  # display already on: just restart the timer
+
+# -----------------------------------------------------------------------------
+#  Physical buttons
+# -----------------------------------------------------------------------------
+
+binary_sensor:
+  - platform: gpio
+    name: "Left Button (boot)"
+    pin:
+      number: GPIO0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    on_press:
+      - script.execute: wake_display
+
+  - platform: gpio
+    name: "Center Button (pwr)"
+    pin:
+      number: GPIO5
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    on_press:
+      - script.execute: wake_display
+    on_click:
+      # Hold PWR for at least 3s to TURN OFF the device (cuts the BAT_EN latch)
+      min_length: 3s
+      max_length: 15s
+      then:
+        - output.turn_off: bat_power_hold
+
+  - platform: gpio
+    name: "Right Button (plus)"
+    pin:
+      number: GPIO4
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    on_press:
+      - script.execute: wake_display
+
+  # Battery charging status (CHG_STAT = GPIO3, charger open-drain output)
+  - platform: gpio
+    name: "Charging"
+    device_class: battery_charging
+    pin:
+      number: GPIO3
+      inverted: true           # LOW = charging -> ON
+      mode:
+        input: true
+        pullup: true
+
+# -----------------------------------------------------------------------------
+#  Diagnostics
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_db
+    update_interval: 60s
+    on_value:
+      - lvgl.label.update:
+          id: lbl_wifi
+          text:
+            format: "WiFi: %.0f dBm"
+            args: [ 'x' ]
+
+  - platform: uptime
+    name: "Uptime"
+
+  - platform: internal_temperature
+    name: "Internal Temperature"
+
+  - platform: adc
+    name: "Battery Voltage"
+    id: batt_voltage
+    pin: GPIO1
+    attenuation: 12db
+    update_interval: 60s
+    accuracy_decimals: 2
+    filters:
+      - multiply: 3.0          # voltage divider ratio (200k+100k)/100k = 3
+    unit_of_measurement: "V"
+    device_class: voltage
+
+  - platform: copy
+    source_id: batt_voltage
+    name: "Battery %"
+    unit_of_measurement: "%"
+    device_class: battery
+    filters:
+      - calibrate_linear:      # indicative 1S Li-Po calibration (3.30V=0% / 4.20V=100%)
+          - 3.30 -> 0.0
+          - 4.20 -> 100.0
+      - clamp: { min_value: 0, max_value: 100 }
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    ssid:
+      name: "SSID"
+    mac_address:
+      name: "MAC"
+
+button:
+  - platform: restart
+    name: "Restart"
+
+# -----------------------------------------------------------------------------
+#  AUDIO: ES8311 speaker + media_player  (ACTIVE)
+#  I2S: MCLK=8, BCLK=9, WS=10, speaker DOUT=12.  PA enable = GPIO7 (see 'output' above).
+#  ES8311 @0x18 on the shared I2C bus bus_a (42/41).
+#  Exposes a media_player to HA: TTS (tts.speak) + sounds (media_player.play_media).
+#  Dual pipeline (media + announcements) with mixer/resampler as per the official ESPHome docs.
+# -----------------------------------------------------------------------------
+
+i2s_audio:
+  - id: i2s_bus
+    i2s_mclk_pin: GPIO8
+    i2s_bclk_pin: GPIO9
+    i2s_lrclk_pin: GPIO10
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    i2c_id: bus_a
+    address: 0x18
+
+speaker:
+  - platform: i2s_audio          # physical speaker (ES8311 DAC)
+    id: i2s_speaker
+    i2s_audio_id: i2s_bus
+    dac_type: external
+    audio_dac: es8311_dac
+    i2s_dout_pin: GPIO12
+    sample_rate: 48000
+    timeout: never               # keeps the I2S always active: no "pop" from clock restart on each audio
+  - platform: mixer              # combines media + announcements into a single speaker
+    id: spk_mixer                # NB: don't name it 'mixer_speaker' (collides with the internal namespace)
+    output_speaker: i2s_speaker
+    source_speakers:
+      - id: announcement_mixer_input
+      - id: media_mixer_input
+  - platform: resampler
+    id: media_resampler
+    output_speaker: media_mixer_input
+  - platform: resampler
+    id: announcement_resampler
+    output_speaker: announcement_mixer_input
+
+media_player:
+  - platform: speaker
+    name: "Speaker"
+    id: ha_speaker
+    media_pipeline:
+      speaker: media_resampler
+      num_channels: 2
+    announcement_pipeline:
+      speaker: announcement_resampler
+      num_channels: 1
+    buffer_size: 1000000
+    task_stack_in_psram: false
+    volume_max: 85%        # volume ceiling: above this level the amplifier distorts
+    # PA (GPIO7) ON only while there's audio -> no hiss when idle.
+    # No pop because: (1) the I2S stays always warm (timeout: never) so it doesn't
+    # restart, and (2) PA switching on this board is silent (verified).
+    on_play:
+      - output.turn_on: pa_enable
+    on_announcement:
+      - output.turn_on: pa_enable
+    on_idle:
+      - output.turn_off: pa_enable
+
+# #############################################################################
+# #  SECTIONS I HAVEN'T TESTED
+# #  Pins already verified from the official demo.
+# #############################################################################
+
+# -----------------------------------------------------------------------------
+#  MICROPHONE ES7210 + VOICE ASSISTANT
+#  mic DIN=11, ES7210 @0x40 on bus_a. Enable last (Assist satellite).
+# -----------------------------------------------------------------------------
+# microphone:
+#   - platform: i2s_audio
+#     id: mic
+#     i2s_audio_id: i2s_bus
+#     i2s_din_pin: GPIO11
+#     adc_type: external
+#     # ES7210 @0x40 on bus_a: may require additional configuration/component
+#
+# voice_assistant:
+#   id: va
+#   microphone: mic
+#   speaker: i2s_speaker
+#   # use_wake_word / micro_wake_word depending on your Assist pipeline
+
+# -----------------------------------------------------------------------------
+#  IMU QMI8658 (accel + gyroscope) - on bus_a (42/41), INT=GPIO6, addr 0x6B
+#  Not in ESPHome core for now -> requires an external component.
+# -----------------------------------------------------------------------------
+# external_components:
+#   - source:
+#       type: git
+#       url: https://github.com/<repo-with-qmi8658>
+#     components: [ qmi8658 ]
+#
+# sensor:
+#   - platform: qmi8658
+#     i2c_id: bus_a
+#     address: 0x6B
+#     accel_x: { name: "Accel X" }
+#     accel_y: { name: "Accel Y" }
+#     accel_z: { name: "Accel Z" }
+#     gyro_x:  { name: "Gyro X" }
+#     gyro_y:  { name: "Gyro Y" }
+#     gyro_z:  { name: "Gyro Z" }
+#     # interrupt: GPIO6 (if the component supports it)
+
+# -----------------------------------------------------------------------------
+#  microSD (SDMMC 4-bit) - pins VERIFIED from the demo. Limited usefulness in ESPHome.
+# -----------------------------------------------------------------------------
+# sd_mmc_card:
+#   id: sdcard
+#   clk_pin: GPIO16
+#   cmd_pin: GPIO15
+#   data0_pin: GPIO17
+#   data1_pin: GPIO18
+#   data2_pin: GPIO13
+#   data3_pin: GPIO14
+#   mode_1bit: false
