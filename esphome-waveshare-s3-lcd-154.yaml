@@ -119,7 +119,7 @@ light:
     id: backlight
     output: backlight_output
     restore_mode: ALWAYS_ON
-    # The initial brightness (80%) is set in esphome -> on_boot -> light.turn_on
+    # The initial brightness (%) is set in esphome -> on_boot -> light.turn_on
     # LVGL state follows the backlight: turning the screen on/off from HA
     # behaves like wake/standby from touch (LVGL resume / pause).
     on_turn_on:
@@ -146,6 +146,7 @@ display:
       offset_height: 80         # ST7789: GRAM 240x320, panel 240x240 -> 80px unused.
                                 # With rotation:180 the visible window shifts to rows 80-319,
                                 # IMPORTANT: set to 80 if lvgl rotation 180 (with rotation 0 set to 0).
+                                # seems not needed from Esphome 2026.6.0 (can be left at 0 even rotated)
     invert_colors: true
     update_interval: never      # LVGL handles the refresh
     auto_clear_enabled: false
